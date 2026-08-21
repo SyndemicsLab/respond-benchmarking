@@ -1,0 +1,87 @@
+---
+title: "RESPOND v1 vs v2 Benchmark Comparison"
+format:
+  html:
+    toc: true
+execute:
+  echo: false
+---
+
+```{r}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+```
+
+## Inputs
+
+```{r}
+combined_path <- "data/combined_runtime.csv"
+if (!file.exists(combined_path)) {
+    stop(
+        "Missing data/combined_runtime.csv. Run scripts/prepare_benchmark_data.R after generating v1 and v2 runtime CSVs."
+    )
+}
+
+runtime <- read_csv(combined_path, show_col_types = FALSE) |>
+    mutate(model = factor(model, levels = c("v1", "v2")))
+
+required_models <- c("v1", "v2")
+present_models <- unique(as.character(runtime$model))
+if (!all(required_models %in% present_models)) {
+    stop("Combined runtime file must include both models: v1 and v2.")
+}
+```
+
+## Summary Table (Direct v1 vs v2)
+
+```{r}
+summary_tbl <- runtime |>
+    group_by(model) |>
+    summarise(
+        mean_of_means_ms = mean(mean_ms, na.rm = TRUE),
+        median_of_means_ms = median(mean_ms, na.rm = TRUE),
+        mean_p95_ms = mean(p95_ms, na.rm = TRUE),
+        mean_std_ms = mean(std_ms, na.rm = TRUE),
+        n_sample_sizes = n_distinct(sample_size),
+        .groups = "drop"
+    ) |>
+    arrange(model)
+
+kable(summary_tbl, digits = 3)
+```
+
+```{r}
+compare_tbl <- runtime |>
+    select(model, sample_size, mean_ms, p95_ms, std_ms) |>
+    pivot_wider(
+        names_from = model,
+        values_from = c(mean_ms, p95_ms, std_ms),
+        names_glue = "{.value}_{model}"
+    ) |>
+    mutate(
+        mean_speedup_v1_over_v2 = mean_ms_v1 / mean_ms_v2,
+        p95_speedup_v1_over_v2 = p95_ms_v1 / p95_ms_v2
+    ) |>
+    arrange(sample_size)
+
+kable(compare_tbl, digits = 3)
+```
+
+## Runtime Over Sample Size
+
+```{r}
+ggplot(runtime, aes(x = sample_size, y = mean_ms, color = model)) +
+    W
+geom_point(size = 2.2) +
+    scale_x_continuous(breaks = sort(unique(runtime$sample_size))) +
+    labs(
+        title = "Runtime vs Sample Size",
+        x = "Sample Size",
+        y = "Mean Runtime (ms)",
+        color = "Model"
+    ) +
+    theme_minimal(base_size = 12)
+```

@@ -1,0 +1,8 @@
+*.html
+benchmark_report_files/
+*.log
+*.png
+*.conf
+*.db
+__pycache__/
+.quarto/

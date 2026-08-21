@@ -1,0 +1,313 @@
+---
+title: "RESPOND v1 vs v2 End-to-End Benchmark"
+format:
+  html:
+    toc: true
+execute:
+  echo: false
+---
+
+```{r}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+```
+
+## Overview
+
+This report measures the **total wall-clock runtime** of the full RESPOND
+simulation pipeline for v1 and v2, covering three phases:
+
+| Phase | v1 | v2 (respondpy) |
+|---|---|---|
+| **Load** | Read CSV input files → R matrices | Read SQLite DB → `Simulation` object |
+| **Run** | Rcpp `sim()` | `sim.run()` |
+| **Write** | `write.table()` to CSV | Polars → CSV files |
+
+### Scaling methodology
+
+Each "sample" represents one independent pipeline execution:
+
+- **v2**: one cohort ID in the SQLite database. `N` samples means `N` cohort
+  rows (all backed by the same parameter tables); `build_simulation()` loads
+  and runs all `N` cohorts in a single call.
+- **v1**: one full read → sim → write cycle. `N` samples means the entire
+  pipeline is repeated `N` times with fixed-size inputs (13 intervention
+  blocks, 1 age group, 1 sex group, 4 OUD states, 52 steps).
+
+Because the two models scale differently by design—v2 horizontally (more
+cohort instances) and v1 vertically via repeated pipeline calls—direct
+per-sample comparisons reflect architectural throughput rather than identical
+workloads.
+
+---
+
+## Inputs
+
+```{r}
+combined_path <- "data/combined_e2e_runtime.csv"
+if (!file.exists(combined_path)) {
+    stop(
+        "Missing data/combined_e2e_runtime.csv.",
+        " Run scripts/run_v1_e2e_benchmark.R and scripts/run_v2_e2e_benchmark.py,",
+        " then scripts/prepare_e2e_benchmark_data.R."
+    )
+}
+
+runtime <- read_csv(combined_path, show_col_types = FALSE) |>
+    mutate(
+        model = factor(model, levels = c("v1", "v2")),
+        scope = factor(scope, levels = c("cold_start", "steady_state")),
+        phase = factor(phase, levels = c("combined", "load", "run", "write"))
+    )
+
+required_models <- c("v1", "v2")
+present_models <- unique(as.character(runtime$model))
+if (!all(required_models %in% present_models)) {
+    stop("Combined e2e runtime file must include both models: v1 and v2.")
+}
+
+required_phases <- c("combined", "load", "run", "write")
+present_phases <- unique(as.character(runtime$phase))
+if (!all(required_phases %in% present_phases)) {
+    stop(
+        sprintf(
+            "Missing phases: %s",
+            paste(setdiff(required_phases, present_phases), collapse = ", ")
+        )
+    )
+}
+
+required_scopes <- c("cold_start", "steady_state")
+present_scopes <- unique(as.character(runtime$scope))
+if (!all(required_scopes %in% present_scopes)) {
+    stop(
+        sprintf(
+            "Missing scopes: %s",
+            paste(setdiff(required_scopes, present_scopes), collapse = ", ")
+        )
+    )
+}
+```
+
+---
+
+## Combined Pipeline Summary
+
+```{r}
+combined_runtime <- runtime |>
+    filter(scope == "steady_state", phase == "combined")
+
+summary_tbl <- combined_runtime |>
+    group_by(model) |>
+    summarise(
+        mean_of_means_job_ms = mean(mean_job_ms, na.rm = TRUE),
+        median_of_means_job_ms = median(mean_job_ms, na.rm = TRUE),
+        mean_p95_job_ms = mean(p95_job_ms, na.rm = TRUE),
+        mean_std_job_ms = mean(std_job_ms, na.rm = TRUE),
+        mean_of_means_sample_ms = mean(mean_sample_ms, na.rm = TRUE),
+        n_sample_sizes = n_distinct(sample_size),
+        .groups = "drop"
+    ) |>
+    arrange(model)
+
+kable(summary_tbl,
+    digits = 3,
+    caption = "Combined pipeline (load + run + write) summary across all sample sizes"
+)
+```
+
+```{r}
+compare_tbl <- combined_runtime |>
+    select(model, sample_size, mean_job_ms, p95_job_ms, std_job_ms, mean_sample_ms) |>
+    pivot_wider(
+        names_from  = model,
+        values_from = c(mean_job_ms, p95_job_ms, std_job_ms, mean_sample_ms),
+        names_glue  = "{.value}_{model}"
+    ) |>
+    mutate(
+        mean_job_ratio_v1_over_v2 = mean_job_ms_v1 / mean_job_ms_v2,
+        p95_job_ratio_v1_over_v2 = p95_job_ms_v1 / p95_job_ms_v2,
+        mean_sample_ratio_v1_over_v2 = mean_sample_ms_v1 / mean_sample_ms_v2
+    ) |>
+    arrange(sample_size) |>
+    select(-c(p95_job_ms_v1, p95_job_ms_v2, std_job_ms_v1, std_job_ms_v2, mean_sample_ms_v1, mean_sample_ms_v2, mean_job_ratio_v1_over_v2, p95_job_ratio_v1_over_v2, mean_sample_ratio_v1_over_v2))
+
+kable(compare_tbl,
+    digits = 3,
+    caption = "Steady-state combined runtime: v1 vs v2 comparison by sample size"
+)
+```
+
+---
+
+## Combined Pipeline Runtime vs Sample Size
+
+```{r fig.width=8, fig.height=4.5}
+ggplot(combined_runtime, aes(x = sample_size, y = mean_job_ms, color = model)) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 2.5) +
+    geom_errorbar(
+        aes(ymin = mean_job_ms - std_job_ms, ymax = mean_job_ms + std_job_ms),
+        width = 0.5, alpha = 0.5
+    ) +
+    scale_x_continuous(breaks = sort(unique(combined_runtime$sample_size))) +
+    labs(
+        title  = "Steady-state end-to-end runtime: combined pipeline",
+        x      = "Sample size (N pipeline iterations / cohorts)",
+        y      = "Mean job runtime (ms)",
+        color  = "Model"
+    ) +
+    theme_bw()
+```
+
+---
+
+## User Throughput Comparison
+
+Throughput is expressed as **samples processed per second**, derived from the
+steady-state per-sample cost (`1000 / mean_sample_ms`). This normalizes v1's
+repeated-pipeline runs and v2's cohort-batch runs to a common "samples/sec"
+unit for direct comparison.
+
+```{r}
+throughput_tbl <- combined_runtime |>
+    mutate(throughput_samples_per_sec = 1000 / mean_sample_ms) |>
+    select(model, sample_size, mean_sample_ms, throughput_samples_per_sec)
+
+speedup_tbl <- throughput_tbl |>
+    pivot_wider(
+        id_cols = sample_size,
+        names_from = model,
+        values_from = throughput_samples_per_sec,
+        names_glue = "throughput_{model}"
+    ) |>
+    mutate(speedup_v2_over_v1 = throughput_v2 / throughput_v1) |>
+    arrange(sample_size)
+
+kable(speedup_tbl,
+    digits = 2,
+    caption = "v2 throughput speedup over v1 by sample size"
+)
+```
+
+```{r fig.width=8, fig.height=4.5}
+ggplot(throughput_tbl, aes(x = sample_size, y = throughput_samples_per_sec, color = model)) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 2.5) +
+    scale_x_continuous(breaks = sort(unique(throughput_tbl$sample_size))) +
+    scale_y_log10() +
+    scale_color_manual(values = c(v1 = "#f0325f", v2 = "#3d9be9")) +
+    labs(
+        title = "Log-Scaled Throughput Comparison",
+        x     = "Sample Size (N iterations / cohorts)",
+        y     = "Log-Scaled Throughput (samples/sec)",
+        color = "Model"
+    ) +
+    theme_bw()
+```
+
+```{r fig.width=8, fig.height=4.5}
+ggplot(speedup_tbl, aes(x = factor(sample_size), y = speedup_v2_over_v1)) +
+    geom_col(fill = "#3d9be9") +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "#f0325f") +
+    geom_text(aes(label = sprintf("%.1fx", speedup_v2_over_v1)), vjust = -0.4, color = "#003771") +
+    labs(
+        title = "v2 throughput speedup over v1",
+        x     = "Sample size",
+        y     = "Speedup (v2 throughput / v1 throughput)"
+    ) +
+    theme_bw()
+```
+
+```{r fig.width=8, fig.height=4.5}
+ggplot(combined_runtime, aes(x = sample_size, y = mean_sample_ms, color = model)) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 2.5) +
+    scale_x_log10(breaks = sort(unique(combined_runtime$sample_size))) +
+    scale_y_log10() +
+    labs(
+        title = "Per-sample cost vs. sample size (log-log)",
+        x     = "Sample size (log scale)",
+        y     = "Mean time per sample (ms, log scale)",
+        color = "Model"
+    ) +
+    theme_bw()
+```
+
+---
+
+## Phase Breakdown
+
+```{r}
+phase_tbl <- runtime |>
+    filter(scope == "steady_state") |>
+    group_by(model, phase) |>
+    summarise(
+        mean_of_means_job_ms = mean(mean_job_ms, na.rm = TRUE),
+        mean_p95_job_ms = mean(p95_job_ms, na.rm = TRUE),
+        .groups = "drop"
+    ) |>
+    arrange(phase, model)
+
+kable(phase_tbl,
+    digits = 3,
+    caption = "Mean runtime (ms) per phase, averaged across all sample sizes"
+)
+```
+
+```{r fig.width=9, fig.height=5}
+ggplot(runtime |> filter(scope == "steady_state"), aes(x = sample_size, y = mean_job_ms, color = model)) +
+    geom_line(linewidth = 0.8) +
+    geom_point(size = 2) +
+    facet_wrap(~phase, scales = "free_y", nrow = 2) +
+    scale_x_continuous(breaks = sort(unique(runtime$sample_size))) +
+    labs(
+        title  = "Steady-state job runtime per phase vs sample size",
+        x      = "Sample size",
+        y      = "Mean job runtime (ms)",
+        color  = "Model"
+    ) +
+    theme_bw()
+```
+
+---
+
+## Phase Composition (v2 only)
+
+For v2 the three phases are measured separately, showing how load, run, and
+write each contribute to the total pipeline cost.
+
+```{r fig.width=7, fig.height=4.5}
+v2_phases <- runtime |>
+    filter(scope == "steady_state", model == "v2", phase != "combined") |>
+    group_by(phase, sample_size) |>
+    summarise(mean_job_ms = mean(mean_job_ms, na.rm = TRUE), .groups = "drop")
+
+ggplot(v2_phases, aes(x = sample_size, y = mean_job_ms, fill = phase)) +
+    geom_col(position = "stack") +
+    scale_x_continuous(breaks = sort(unique(v2_phases$sample_size))) +
+    labs(
+        title = "v2 pipeline phase composition by sample size",
+        x     = "Sample size (cohort count)",
+        y     = "Stacked mean job runtime (ms)",
+        fill  = "Phase"
+    ) +
+    theme_bw()
+```
+
+---
+
+## Notes
+
+- **Warmup**: Each benchmark script discards an initial set of warmup
+  iterations before timing begins (default: 3).
+- **Repetitions**: Timing statistics are computed across multiple repetitions
+  (default: 3), with all per-sample times pooled.
+- **Sample sizes**: `1 5 10 25 50` (smaller grid than the simulation-only
+  benchmark to keep total run time reasonable given the repeated I/O cost).
+- **v1 cost analysis**: disabled (sentinel `-1` values) so the simulation
+  code path matches the parity configuration used for the simulation-only
+  benchmark.
